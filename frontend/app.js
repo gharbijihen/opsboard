@@ -7,6 +7,9 @@ const state = {
 
 const elements = {
   adminToken: document.querySelector('#adminToken'),
+  deleteModal: document.querySelector('#deleteModal'),
+  deleteModalCancel: document.querySelector('#deleteModalCancel'),
+  deleteModalConfirm: document.querySelector('#deleteModalConfirm'),
   form: document.querySelector('#incidentForm'),
   formStatus: document.querySelector('#formStatus'),
   list: document.querySelector('#incidentList'),
@@ -18,6 +21,55 @@ const elements = {
   statTotal: document.querySelector('#statTotal'),
   statusFilter: document.querySelector('#statusFilter')
 };
+
+function confirmDelete() {
+  const modal = elements.deleteModal;
+
+  return new Promise((resolve) => {
+    function settle(result) {
+      document.removeEventListener('keydown', onKeydown);
+      modal.removeEventListener('click', onOverlayClick);
+      elements.deleteModalConfirm.removeEventListener('click', onConfirm);
+      elements.deleteModalCancel.removeEventListener('click', onCancel);
+
+      modal.classList.add('closing');
+      modal.addEventListener('animationend', () => {
+        modal.hidden = true;
+        modal.classList.remove('closing');
+      }, { once: true });
+
+      resolve(result);
+    }
+
+    function onConfirm() {
+      settle(true);
+    }
+
+    function onCancel() {
+      settle(false);
+    }
+
+    function onOverlayClick(event) {
+      if (event.target === modal) {
+        settle(false);
+      }
+    }
+
+    function onKeydown(event) {
+      if (event.key === 'Escape') {
+        settle(false);
+      }
+    }
+
+    modal.classList.remove('closing');
+    modal.hidden = false;
+    elements.deleteModalConfirm.addEventListener('click', onConfirm);
+    elements.deleteModalCancel.addEventListener('click', onCancel);
+    modal.addEventListener('click', onOverlayClick);
+    document.addEventListener('keydown', onKeydown);
+    elements.deleteModalConfirm.focus();
+  });
+}
 
 function titleCase(value) {
   return value
@@ -188,11 +240,13 @@ async function deleteIncident(event) {
     return;
   }
 
-  if (!window.confirm('Delete this incident? This cannot be undone.')) {
+  const confirmed = await confirmDelete();
+  if (!confirmed) {
     return;
   }
 
   button.disabled = true;
+  elements.deleteModalConfirm.classList.add('loading');
 
   try {
     await api(`/api/incidents/${encodeURIComponent(button.dataset.deleteId)}`, {
@@ -202,6 +256,8 @@ async function deleteIncident(event) {
   } catch (error) {
     elements.formStatus.textContent = error.message;
     button.disabled = false;
+  } finally {
+    elements.deleteModalConfirm.classList.remove('loading');
   }
 }
 
