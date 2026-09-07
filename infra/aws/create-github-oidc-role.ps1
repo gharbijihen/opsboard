@@ -3,7 +3,7 @@ param(
   [string]$Region = "eu-west-3",
   [string]$StackName = "opsboard-prod",
   [string]$GitHubOwner = "gharbijihen",
-  [string]$GitHubRepo = "exercice-aws",
+  [string]$GitHubRepo = "opsboard",
   [string]$BranchName = "main",
   [string]$RoleName = "",
   [string]$Profile = ""
