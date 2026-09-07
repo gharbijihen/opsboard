@@ -1,0 +1,100 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>OpsBoard</title>
+    <link rel="icon" type="image/svg+xml" href="/favicon.svg">
+    <link rel="stylesheet" href="/styles.css">
+    <script type="module" src="/app.js"></script>
+  </head>
+  <body>
+    <header class="app-header">
+      <div>
+        <p class="eyebrow">Production exercise</p>
+        <h1>OpsBoard</h1>
+      </div>
+      <div class="token-control">
+        <label for="adminToken">Admin token</label>
+        <input id="adminToken" type="password" autocomplete="off" placeholder="Bearer token">
+      </div>
+    </header>
+
+    <main class="layout">
+      <section class="summary-grid" aria-label="Incident summary">
+        <article class="summary-card summary-card-total">
+          <span>Total</span>
+          <strong id="statTotal">0</strong>
+        </article>
+        <article class="summary-card summary-card-open">
+          <span>Open</span>
+          <strong id="statOpen">0</strong>
+        </article>
+        <article class="summary-card summary-card-progress">
+          <span>In progress</span>
+          <strong id="statProgress">0</strong>
+        </article>
+        <article class="summary-card summary-card-critical">
+          <span>Critical active</span>
+          <strong id="statCritical">0</strong>
+        </article>
+      </section>
+
+      <section class="work-area">
+        <form id="incidentForm" class="panel incident-form">
+          <div class="panel-heading">
+            <h2>New Incident</h2>
+          </div>
+          <label>
+            Title
+            <input name="title" required minlength="3" maxlength="120" placeholder="Checkout latency above target">
+          </label>
+          <label>
+            Description
+            <textarea name="description" maxlength="1000" rows="5" placeholder="Short operational context"></textarea>
+          </label>
+          <div class="form-row">
+            <label>
+              Priority
+              <select name="priority">
+                <option value="low">Low</option>
+                <option value="medium" selected>Medium</option>
+                <option value="high">High</option>
+                <option value="critical">Critical</option>
+              </select>
+            </label>
+            <label>
+              Owner
+              <input name="owner" maxlength="80" placeholder="platform">
+            </label>
+          </div>
+          <button type="submit">Create Incident</button>
+          <p id="formStatus" class="status-line" role="status"></p>
+        </form>
+
+        <section class="panel incident-list-panel">
+          <div class="panel-heading list-heading">
+            <h2>Incidents</h2>
+            <div class="filters">
+              <input id="searchInput" type="search" placeholder="Search">
+              <select id="statusFilter" aria-label="Status filter">
+                <option value="">All status</option>
+                <option value="open">Open</option>
+                <option value="in_progress">In progress</option>
+                <option value="resolved">Resolved</option>
+              </select>
+              <select id="priorityFilter" aria-label="Priority filter">
+                <option value="">All priority</option>
+                <option value="low">Low</option>
+                <option value="medium">Medium</option>
+                <option value="high">High</option>
+                <option value="critical">Critical</option>
+              </select>
+            </div>
+          </div>
+          <div id="incidentList" class="incident-list" aria-live="polite"></div>
+        </section>
+      </section>
+    </main>
+  </body>
+</html>
