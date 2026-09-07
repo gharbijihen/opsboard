@@ -7,7 +7,7 @@ OpsBoard is a small production-style incident board built for the technical exer
 The active deployment runs on **ECS Fargate** (`infra/aws/`), deployed automatically by GitHub Actions on every push to `main`:
 
 ```text
-http://opsboard-alb-854896720.eu-west-3.elb.amazonaws.com
+http://opsboard-alb-1123436292.eu-west-3.elb.amazonaws.com
 ```
 
 An EKS (Kubernetes) deployment path also exists (`infra/eks/`) and was fully tested and validated, but is **not currently deployed** — it was torn down after validation to avoid running two environments at once. See "AWS EKS Deployment" below to redeploy it if needed.
@@ -197,14 +197,9 @@ Deployment workflow expects this GitHub secret:
 Deployment workflow expects these GitHub variables:
 
 - `AWS_REGION`
-- `AWS_STACK_NAME`
-- `AWS_ECR_BACKEND_REPOSITORY`
-- `AWS_ECR_FRONTEND_REPOSITORY`
-- `AWS_ECS_CLUSTER`
-- `AWS_ECS_BACKEND_SERVICE`
-- `AWS_ECS_FRONTEND_SERVICE`
-- `AWS_BACKEND_TASK_FAMILY`
-- `AWS_FRONTEND_TASK_FAMILY`
+- `APP_NAME`
+
+The deploy job only reads `APP_NAME` and `AWS_REGION` — every resource name (stack, ECR repositories, ECS cluster/services, task families) is derived from `APP_NAME` at run time (e.g. `${APP_NAME}-cluster`, `${APP_NAME}-api`), so it must match the `-AppName` value passed to `infra/aws/deploy.ps1`.
 
 The first infrastructure deployment should be done with `infra/aws/deploy.ps1`. After that, the GitHub Actions deployment workflow updates the existing ECS services with each push to `main`.
 
