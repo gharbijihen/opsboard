@@ -1,0 +1,20 @@
+{
+  "name": "opsboard",
+  "version": "1.0.0",
+  "description": "AWS-ready incident board exercise app with UI, backend API, PostgreSQL, tests, Docker, CI/CD, and deployment scripts.",
+  "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "start": "node src/server.js",
+    "lint": "node scripts/lint.js",
+    "test": "node --test",
+    "test:e2e": "node --test test/e2e.test.js",
+    "check": "npm run lint && npm test",
+    "load:local": "node load/smoke-load.js"
+  },
+  "dependencies": {
+    "pg": "8.16.3"
+  }
+}
