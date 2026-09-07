@@ -388,6 +388,10 @@ button.danger:hover {
   }
 }
 
+.modal-overlay[hidden] {
+  display: none;
+}
+
 .modal-overlay {
   align-items: center;
   background: rgb(15 23 42 / 55%);
