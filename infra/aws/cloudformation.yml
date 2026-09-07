@@ -328,7 +328,7 @@ Resources:
             - Name: APP_VERSION
               Value: initial
             - Name: BACKEND_ORIGIN
-              Value: http://127.0.0.1:8080
+              Value: !Sub "http://${LoadBalancer.DNSName}"
             - Name: NODE_ENV
               Value: production
             - Name: PORT
