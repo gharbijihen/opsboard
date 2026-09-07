@@ -1,0 +1,182 @@
+name: Reconcile Infrastructure
+
+on:
+  schedule:
+    - cron: "0 3 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  reconcile:
+    name: Reconcile CloudFormation With Git
+    if: vars.APP_NAME != ''
+    runs-on: ubuntu-latest
+    env:
+      APP_NAME: ${{ vars.APP_NAME }}
+      AWS_REGION: ${{ vars.AWS_REGION }}
+      AWS_STACK_NAME: ${{ vars.APP_NAME }}-prod
+      ECS_CLUSTER: ${{ vars.APP_NAME }}-cluster
+      BACKEND_SERVICE: ${{ vars.APP_NAME }}-api
+      FRONTEND_SERVICE: ${{ vars.APP_NAME }}
+      BACKEND_REPOSITORY: ${{ vars.APP_NAME }}-backend
+      FRONTEND_REPOSITORY: ${{ vars.APP_NAME }}-frontend
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v6.2.4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: Check if the stack already exists
+        id: stack_check
+        run: |
+          if aws cloudformation describe-stacks --stack-name "$AWS_STACK_NAME" >/dev/null 2>&1; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      # ---- Bootstrap path: nothing exists yet, build it all from scratch ----
+
+      - name: "Bootstrap: determine VPC and subnets"
+        if: steps.stack_check.outputs.exists == 'false'
+        run: |
+          VPC_ID="${{ vars.AWS_VPC_ID }}"
+          if [ -z "$VPC_ID" ]; then
+            VPC_ID=$(aws ec2 describe-vpcs --filters Name=isDefault,Values=true --query "Vpcs[0].VpcId" --output text)
+          fi
+          if [ -z "$VPC_ID" ] || [ "$VPC_ID" = "None" ]; then
+            echo "::error::No default VPC found in $AWS_REGION. Set the AWS_VPC_ID repository variable."
+            exit 1
+          fi
+
+          SUBNET_IDS="${{ vars.AWS_SUBNET_IDS }}"
+          if [ -z "$SUBNET_IDS" ]; then
+            SUBNET_IDS=$(aws ec2 describe-subnets --filters "Name=vpc-id,Values=$VPC_ID" --query "Subnets[].SubnetId" --output text | tr '\t' ',')
+          fi
+
+          echo "VPC_ID=$VPC_ID" >> "$GITHUB_ENV"
+          echo "SUBNET_IDS=$SUBNET_IDS" >> "$GITHUB_ENV"
+          echo "DB_NAME=${{ vars.AWS_DB_NAME || vars.APP_NAME }}" >> "$GITHUB_ENV"
+          echo "DB_USER=${{ vars.AWS_DB_ADMIN_USER || format('{0}admin', vars.APP_NAME) }}" >> "$GITHUB_ENV"
+
+      - name: "Bootstrap: ensure ECR repositories exist"
+        if: steps.stack_check.outputs.exists == 'false'
+        run: |
+          for repo in "$BACKEND_REPOSITORY" "$FRONTEND_REPOSITORY"; do
+            if ! aws ecr describe-repositories --repository-names "$repo" >/dev/null 2>&1; then
+              aws ecr create-repository \
+                --repository-name "$repo" \
+                --image-scanning-configuration scanOnPush=true \
+                --encryption-configuration encryptionType=AES256
+            fi
+          done
+
+      - name: "Bootstrap: login to Amazon ECR"
+        if: steps.stack_check.outputs.exists == 'false'
+        id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: "Bootstrap: build and push initial images"
+        if: steps.stack_check.outputs.exists == 'false'
+        run: |
+          BACKEND_IMAGE="${{ steps.ecr.outputs.registry }}/$BACKEND_REPOSITORY:${{ github.sha }}"
+          FRONTEND_IMAGE="${{ steps.ecr.outputs.registry }}/$FRONTEND_REPOSITORY:${{ github.sha }}"
+          docker build --file backend/Dockerfile --tag "$BACKEND_IMAGE" .
+          docker build --file frontend/Dockerfile --tag "$FRONTEND_IMAGE" .
+          docker push "$BACKEND_IMAGE"
+          docker push "$FRONTEND_IMAGE"
+          echo "BACKEND_IMAGE=$BACKEND_IMAGE" >> "$GITHUB_ENV"
+          echo "FRONTEND_IMAGE=$FRONTEND_IMAGE" >> "$GITHUB_ENV"
+
+      - name: "Bootstrap: generate and persist runtime secrets"
+        if: steps.stack_check.outputs.exists == 'false'
+        env:
+          GH_TOKEN: ${{ secrets.GH_BOOTSTRAP_PAT }}
+        run: |
+          DB_PASSWORD=$(openssl rand -base64 48 | tr -dc 'A-Za-z0-9' | head -c 32)
+          ADMIN_TOKEN=$(openssl rand -base64 60 | tr -dc 'A-Za-z0-9' | head -c 40)
+          echo "::add-mask::$DB_PASSWORD"
+          echo "::add-mask::$ADMIN_TOKEN"
+          echo "DB_PASSWORD=$DB_PASSWORD" >> "$GITHUB_ENV"
+          echo "ADMIN_TOKEN=$ADMIN_TOKEN" >> "$GITHUB_ENV"
+          gh secret set DB_ADMIN_PASSWORD --repo "${{ github.repository }}" --body "$DB_PASSWORD"
+          gh secret set ADMIN_TOKEN --repo "${{ github.repository }}" --body "$ADMIN_TOKEN"
+
+      # ---- Reconcile path: stack already exists, resync it with git ----
+
+      - name: "Reconcile: gather current stack parameters and running images"
+        if: steps.stack_check.outputs.exists == 'true'
+        run: |
+          PARAMS=$(aws cloudformation describe-stacks --stack-name "$AWS_STACK_NAME" --query "Stacks[0].Parameters" --output json)
+          echo "$PARAMS" > /tmp/params.json
+
+          get_param() { jq -r --arg k "$1" '.[] | select(.ParameterKey==$k) | .ParameterValue' /tmp/params.json; }
+
+          echo "VPC_ID=$(get_param VpcId)" >> "$GITHUB_ENV"
+          echo "SUBNET_IDS=$(get_param SubnetIds)" >> "$GITHUB_ENV"
+          echo "DB_NAME=$(get_param DatabaseName)" >> "$GITHUB_ENV"
+          echo "DB_USER=$(get_param DatabaseAdminUser)" >> "$GITHUB_ENV"
+
+          # The CloudFormation image parameters are only ever set on the first
+          # bootstrap deploy -- the regular CI/CD job updates ECS task
+          # definitions directly and never touches this stack's parameters.
+          # Read the currently-running images from ECS instead of the (stale)
+          # CloudFormation parameters, so reconciling never reverts a real
+          # deployment back to the bootstrap image.
+          BACKEND_TASK_DEF=$(aws ecs describe-services --cluster "$ECS_CLUSTER" --services "$BACKEND_SERVICE" --query "services[0].taskDefinition" --output text)
+          FRONTEND_TASK_DEF=$(aws ecs describe-services --cluster "$ECS_CLUSTER" --services "$FRONTEND_SERVICE" --query "services[0].taskDefinition" --output text)
+          BACKEND_IMAGE=$(aws ecs describe-task-definition --task-definition "$BACKEND_TASK_DEF" --query "taskDefinition.containerDefinitions[0].image" --output text)
+          FRONTEND_IMAGE=$(aws ecs describe-task-definition --task-definition "$FRONTEND_TASK_DEF" --query "taskDefinition.containerDefinitions[0].image" --output text)
+          echo "BACKEND_IMAGE=$BACKEND_IMAGE" >> "$GITHUB_ENV"
+          echo "FRONTEND_IMAGE=$FRONTEND_IMAGE" >> "$GITHUB_ENV"
+
+      - name: "Reconcile: load runtime secrets"
+        if: steps.stack_check.outputs.exists == 'true'
+        env:
+          DB_ADMIN_PASSWORD: ${{ secrets.DB_ADMIN_PASSWORD }}
+          ADMIN_TOKEN_SECRET: ${{ secrets.ADMIN_TOKEN }}
+        run: |
+          echo "DB_PASSWORD=$DB_ADMIN_PASSWORD" >> "$GITHUB_ENV"
+          echo "ADMIN_TOKEN=$ADMIN_TOKEN_SECRET" >> "$GITHUB_ENV"
+
+      # ---- Converged: create-or-update the stack with whichever values were gathered above ----
+
+      - name: Reconcile CloudFormation stack with git
+        run: |
+          aws cloudformation deploy \
+            --template-file infra/aws/cloudformation.yml \
+            --stack-name "$AWS_STACK_NAME" \
+            --region "$AWS_REGION" \
+            --capabilities CAPABILITY_IAM CAPABILITY_NAMED_IAM \
+            --no-fail-on-empty-changeset \
+            --parameter-overrides \
+              AppName="$APP_NAME" \
+              VpcId="$VPC_ID" \
+              SubnetIds="$SUBNET_IDS" \
+              BackendImageUri="$BACKEND_IMAGE" \
+              FrontendImageUri="$FRONTEND_IMAGE" \
+              DatabaseName="$DB_NAME" \
+              DatabaseAdminUser="$DB_USER" \
+              DatabaseAdminPassword="$DB_PASSWORD" \
+              AdminToken="$ADMIN_TOKEN" \
+            2> /tmp/deploy-err.log || { echo "::error::cloudformation deploy failed: $(cat /tmp/deploy-err.log)"; exit 1; }
+
+      - name: Write reconciliation summary
+        run: |
+          {
+            echo "## Reconciliation"
+            echo ""
+            if [ "${{ steps.stack_check.outputs.exists }}" = "false" ]; then
+              echo "Stack \`$AWS_STACK_NAME\` did not exist -- bootstrapped from zero (ECR repositories, CloudFormation stack, ECS cluster/services, RDS, secrets) from \`infra/aws/cloudformation.yml\` on \`main\`."
+            else
+              echo "CloudFormation stack \`$AWS_STACK_NAME\` re-applied from \`infra/aws/cloudformation.yml\` on \`main\`."
+              echo "Any manual AWS console/CLI changes outside Git have been reverted to match the repository."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
