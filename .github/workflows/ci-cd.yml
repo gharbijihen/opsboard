@@ -1,0 +1,292 @@
+name: CI/CD
+run-name: CI/CD for ${{ github.ref_name }} by ${{ github.actor }}
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+concurrency:
+  group: opsboard-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  validate:
+    name: Validate, Test, And Build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: backend/package-lock.json
+
+      - name: Install backend dependencies
+        run: npm ci --prefix backend
+
+      - name: Lint and test
+        run: npm run check --prefix backend
+
+      - name: Dependency audit
+        run: npm audit --audit-level=high --prefix backend
+
+      - name: Validate Docker Compose
+        run: docker compose config
+
+      - name: Build backend Docker image
+        run: docker build --file backend/Dockerfile --tag opsboard-backend:${{ github.sha }} .
+
+      - name: Build frontend Docker image
+        run: docker build --file frontend/Dockerfile --tag opsboard-frontend:${{ github.sha }} .
+
+      - name: Scan backend image for vulnerabilities
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          image-ref: opsboard-backend:${{ github.sha }}
+          severity: CRITICAL,HIGH
+          exit-code: "1"
+          ignore-unfixed: true
+
+      - name: Scan frontend image for vulnerabilities
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          image-ref: opsboard-frontend:${{ github.sha }}
+          severity: CRITICAL,HIGH
+          exit-code: "1"
+          ignore-unfixed: true
+
+  deploy-ecs:
+    name: Deploy To AWS (ECS Fargate)
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main' && vars.APP_NAME != ''
+    needs: validate
+    runs-on: ubuntu-latest
+    env:
+      AWS_REGION: ${{ vars.AWS_REGION }}
+      AWS_STACK_NAME: ${{ vars.APP_NAME }}-prod
+      AWS_ROLE_TO_ASSUME: ${{ secrets.AWS_ROLE_TO_ASSUME }}
+      BACKEND_CONTAINER_NAME: backend
+      BACKEND_REPOSITORY: ${{ vars.APP_NAME }}-backend
+      BACKEND_SERVICE: ${{ vars.APP_NAME }}-api
+      BACKEND_TASK_FAMILY: ${{ vars.APP_NAME }}-api
+      ECS_CLUSTER: ${{ vars.APP_NAME }}-cluster
+      FRONTEND_CONTAINER_NAME: frontend
+      FRONTEND_REPOSITORY: ${{ vars.APP_NAME }}-frontend
+      FRONTEND_SERVICE: ${{ vars.APP_NAME }}
+      FRONTEND_TASK_FAMILY: ${{ vars.APP_NAME }}-frontend
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Validate required configuration
+        run: |
+          test -n "$AWS_REGION"
+          test -n "$AWS_STACK_NAME"
+          test -n "$AWS_ROLE_TO_ASSUME"
+          test -n "$BACKEND_REPOSITORY"
+          test -n "$BACKEND_SERVICE"
+          test -n "$BACKEND_TASK_FAMILY"
+          test -n "$ECS_CLUSTER"
+          test -n "$FRONTEND_REPOSITORY"
+          test -n "$FRONTEND_SERVICE"
+          test -n "$FRONTEND_TASK_FAMILY"
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v6.2.4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build and push images
+        run: |
+          BACKEND_IMAGE="${{ steps.ecr.outputs.registry }}/$BACKEND_REPOSITORY:${GITHUB_SHA}"
+          FRONTEND_IMAGE="${{ steps.ecr.outputs.registry }}/$FRONTEND_REPOSITORY:${GITHUB_SHA}"
+          docker build --file backend/Dockerfile --tag "$BACKEND_IMAGE" .
+          docker build --file frontend/Dockerfile --tag "$FRONTEND_IMAGE" .
+          docker push "$BACKEND_IMAGE"
+          docker push "$FRONTEND_IMAGE"
+          echo "BACKEND_IMAGE=$BACKEND_IMAGE" >> "$GITHUB_ENV"
+          echo "FRONTEND_IMAGE=$FRONTEND_IMAGE" >> "$GITHUB_ENV"
+
+      - name: Deploy backend task definition
+        run: |
+          aws ecs describe-task-definition \
+            --task-definition "$BACKEND_TASK_FAMILY" \
+            --query taskDefinition \
+            --output json \
+            > backend-task-definition.json
+
+          jq \
+            --arg image "$BACKEND_IMAGE" \
+            --arg version "$GITHUB_SHA" \
+            --arg container "$BACKEND_CONTAINER_NAME" \
+            '
+            .containerDefinitions = (.containerDefinitions | map(
+              if .name == $container then
+                .image = $image
+                | .environment = ((.environment // []) | map(if .name == "APP_VERSION" then .value = $version else . end))
+              else
+                .
+              end
+            ))
+            | del(.taskDefinitionArn, .revision, .status, .requiresAttributes, .compatibilities, .registeredAt, .registeredBy)
+            ' backend-task-definition.json > backend-task-definition-next.json
+
+          BACKEND_TASK_DEFINITION_ARN=$(aws ecs register-task-definition \
+            --cli-input-json file://backend-task-definition-next.json \
+            --query "taskDefinition.taskDefinitionArn" \
+            --output text)
+
+          aws ecs update-service \
+            --cluster "$ECS_CLUSTER" \
+            --service "$BACKEND_SERVICE" \
+            --task-definition "$BACKEND_TASK_DEFINITION_ARN"
+
+      - name: Deploy frontend task definition
+        run: |
+          aws ecs describe-task-definition \
+            --task-definition "$FRONTEND_TASK_FAMILY" \
+            --query taskDefinition \
+            --output json \
+            > frontend-task-definition.json
+
+          jq \
+            --arg image "$FRONTEND_IMAGE" \
+            --arg version "$GITHUB_SHA" \
+            --arg container "$FRONTEND_CONTAINER_NAME" \
+            '
+            .containerDefinitions = (.containerDefinitions | map(
+              if .name == $container then
+                .image = $image
+                | .environment = ((.environment // []) | map(if .name == "APP_VERSION" then .value = $version else . end))
+              else
+                .
+              end
+            ))
+            | del(.taskDefinitionArn, .revision, .status, .requiresAttributes, .compatibilities, .registeredAt, .registeredBy)
+            ' frontend-task-definition.json > frontend-task-definition-next.json
+
+          FRONTEND_TASK_DEFINITION_ARN=$(aws ecs register-task-definition \
+            --cli-input-json file://frontend-task-definition-next.json \
+            --query "taskDefinition.taskDefinitionArn" \
+            --output text)
+
+          aws ecs update-service \
+            --cluster "$ECS_CLUSTER" \
+            --service "$FRONTEND_SERVICE" \
+            --task-definition "$FRONTEND_TASK_DEFINITION_ARN"
+
+      - name: Wait for ECS services
+        run: |
+          aws ecs wait services-stable --cluster "$ECS_CLUSTER" --services "$BACKEND_SERVICE"
+          aws ecs wait services-stable --cluster "$ECS_CLUSTER" --services "$FRONTEND_SERVICE"
+
+      - name: Smoke test public URL
+        id: smoke
+        run: |
+          APP_URL=$(aws cloudformation describe-stacks \
+            --stack-name "$AWS_STACK_NAME" \
+            --query "Stacks[0].Outputs[?OutputKey=='ApplicationUrl'].OutputValue | [0]" \
+            --output text)
+          echo "APP_URL=$APP_URL" >> "$GITHUB_ENV"
+          echo "app-url=$APP_URL" >> "$GITHUB_OUTPUT"
+          curl --retry 12 --retry-delay 10 --retry-all-errors --fail "$APP_URL/healthz"
+          curl --retry 12 --retry-delay 10 --retry-all-errors --fail "$APP_URL/readyz"
+
+      - name: Write deployment summary
+        run: |
+          {
+            echo "## AWS deployment (ECS Fargate)"
+            echo ""
+            echo "- Backend image: \`$BACKEND_IMAGE\`"
+            echo "- Frontend image: \`$FRONTEND_IMAGE\`"
+            echo "- URL: $APP_URL"
+            echo "- Smoke checks: /healthz and /readyz passed"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  deploy-eks:
+    name: Deploy To AWS (EKS)
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main' && vars.EKS_CLUSTER_NAME != ''
+    needs: validate
+    runs-on: ubuntu-latest
+    env:
+      AWS_REGION: ${{ vars.AWS_REGION }}
+      AWS_ROLE_TO_ASSUME: ${{ secrets.AWS_ROLE_TO_ASSUME }}
+      BACKEND_REPOSITORY: ${{ vars.AWS_ECR_BACKEND_REPOSITORY }}
+      EKS_CLUSTER_NAME: ${{ vars.EKS_CLUSTER_NAME }}
+      FRONTEND_REPOSITORY: ${{ vars.AWS_ECR_FRONTEND_REPOSITORY }}
+      K8S_NAMESPACE: ${{ vars.K8S_NAMESPACE }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Validate required configuration
+        run: |
+          test -n "$AWS_REGION"
+          test -n "$AWS_ROLE_TO_ASSUME"
+          test -n "$BACKEND_REPOSITORY"
+          test -n "$EKS_CLUSTER_NAME"
+          test -n "$FRONTEND_REPOSITORY"
+          test -n "$K8S_NAMESPACE"
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v6.2.4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build and push images
+        run: |
+          BACKEND_IMAGE="${{ steps.ecr.outputs.registry }}/$BACKEND_REPOSITORY:${GITHUB_SHA}"
+          FRONTEND_IMAGE="${{ steps.ecr.outputs.registry }}/$FRONTEND_REPOSITORY:${GITHUB_SHA}"
+          docker build --file backend/Dockerfile --tag "$BACKEND_IMAGE" .
+          docker build --file frontend/Dockerfile --tag "$FRONTEND_IMAGE" .
+          docker push "$BACKEND_IMAGE"
+          docker push "$FRONTEND_IMAGE"
+          echo "BACKEND_IMAGE=$BACKEND_IMAGE" >> "$GITHUB_ENV"
+          echo "FRONTEND_IMAGE=$FRONTEND_IMAGE" >> "$GITHUB_ENV"
+
+      - name: Update kubeconfig
+        run: aws eks update-kubeconfig --name "$EKS_CLUSTER_NAME" --region "$AWS_REGION"
+
+      - name: Deploy new images
+        run: |
+          kubectl set image deployment/backend backend="$BACKEND_IMAGE" -n "$K8S_NAMESPACE"
+          kubectl set image deployment/frontend frontend="$FRONTEND_IMAGE" -n "$K8S_NAMESPACE"
+          kubectl rollout status deployment/backend -n "$K8S_NAMESPACE" --timeout=180s
+          kubectl rollout status deployment/frontend -n "$K8S_NAMESPACE" --timeout=180s
+
+      - name: Smoke test public URL
+        run: |
+          APP_URL=$(kubectl get ingress frontend -n "$K8S_NAMESPACE" -o jsonpath='http://{.status.loadBalancer.ingress[0].hostname}')
+          echo "APP_URL=$APP_URL" >> "$GITHUB_ENV"
+          curl --retry 12 --retry-delay 10 --retry-all-errors --fail "$APP_URL/healthz"
+          curl --retry 12 --retry-delay 10 --retry-all-errors --fail "$APP_URL/readyz"
+
+      - name: Write deployment summary
+        run: |
+          {
+            echo "## AWS deployment (EKS)"
+            echo ""
+            echo "- Backend image: \`$BACKEND_IMAGE\`"
+            echo "- Frontend image: \`$FRONTEND_IMAGE\`"
+            echo "- URL: $APP_URL"
+            echo "- Smoke checks: /healthz and /readyz passed"
+          } >> "$GITHUB_STEP_SUMMARY"
