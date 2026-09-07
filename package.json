@@ -1,0 +1,15 @@
+{
+  "name": "opsboard-workspace",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Simple workspace wrapper for the OpsBoard frontend, backend, database, Docker, and AWS exercise.",
+  "scripts": {
+    "start": "npm start --prefix backend",
+    "lint": "npm run lint --prefix backend",
+    "test": "npm test --prefix backend",
+    "check": "npm run check --prefix backend",
+    "load:local": "npm run load:local --prefix backend",
+    "docker:up": "docker compose up --build",
+    "docker:config": "docker compose config"
+  }
+}
