@@ -1,0 +1,91 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: OpsBoard RDS PostgreSQL for the EKS runtime, secured to accept traffic only from the EKS cluster security group.
+
+Parameters:
+  AppName:
+    Type: String
+    Default: opsboard
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+  SubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+  ClusterSecurityGroupId:
+    Type: AWS::EC2::SecurityGroup::Id
+    Description: eksctl cluster shared security group (nodes + control plane), used as the allowed source for PostgreSQL ingress.
+  DatabaseName:
+    Type: String
+    Default: opsboard
+  DatabaseAdminUser:
+    Type: String
+    Default: opsboardadmin
+  DatabaseAdminPassword:
+    Type: String
+    NoEcho: true
+
+Resources:
+  DatabaseSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: !Sub "${AppName} private PostgreSQL"
+      GroupName: !Sub "${AppName}-eks-database-sg"
+      VpcId: !Ref VpcId
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+
+  DatabaseFromClusterIngress:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref DatabaseSecurityGroup
+      IpProtocol: tcp
+      FromPort: 5432
+      ToPort: 5432
+      SourceSecurityGroupId: !Ref ClusterSecurityGroupId
+
+  DatabaseSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: !Sub "${AppName} EKS database subnets"
+      DBSubnetGroupName: !Sub "${AppName}-eks-db-subnets"
+      SubnetIds: !Ref SubnetIds
+
+  Database:
+    Type: AWS::RDS::DBInstance
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      AllocatedStorage: 20
+      AutoMinorVersionUpgrade: true
+      BackupRetentionPeriod: 7
+      CopyTagsToSnapshot: true
+      DBInstanceClass: db.t3.micro
+      DBInstanceIdentifier: !Sub "${AppName}-eks-postgres"
+      DBName: !Ref DatabaseName
+      DBSubnetGroupName: !Ref DatabaseSubnetGroup
+      DeleteAutomatedBackups: true
+      Engine: postgres
+      MasterUsername: !Ref DatabaseAdminUser
+      MasterUserPassword: !Ref DatabaseAdminPassword
+      MultiAZ: false
+      PubliclyAccessible: false
+      StorageEncrypted: true
+      VPCSecurityGroups:
+        - !Ref DatabaseSecurityGroup
+
+  DatabaseUrlSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub "${AppName}-eks-database-url"
+      Description: !Sub "${AppName} EKS backend PostgreSQL connection string"
+      SecretString: !Sub
+        - "postgresql://${User}:${Password}@${Host}:5432/${DbName}"
+        - User: !Ref DatabaseAdminUser
+          Password: !Ref DatabaseAdminPassword
+          Host: !GetAtt Database.Endpoint.Address
+          DbName: !Ref DatabaseName
+
+Outputs:
+  DatabaseUrlSecretArn:
+    Value: !Ref DatabaseUrlSecret
+  DatabaseEndpoint:
+    Value: !GetAtt Database.Endpoint.Address
